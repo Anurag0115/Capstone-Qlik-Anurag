@@ -1,0 +1,146 @@
+How your load scripts work
+
+I’m using the saved copies of Script 2 and Script 3 that I can see. Your newest versions add the NA/NULL → Unknown rule, the DD/MM/YYYY dates and the unique key names, but the steps below are the same. I never had Script 1’s text, so I only describe its job.
+
+The big picture: three layers
+Script	Layer	Job	Output
+1	Raw	Load each CSV as it is, with no changes	Raw_*.qvd
+2	Clean	Fix and flag the data, remove duplicates	Clean_*.qvd and Audit_*.qvd
+3	Model	Build the tables the dashboards read	the star schema in the app
+
+Keeping the raw layer untouched is what the brief means by “raw data never overwritten”, and it lets you check any clean figure against the original.
+
+Run them in order: 1, then 2, then 3, because each reads the files the previous one wrote.
+
+Script 1: raw load
+
+It reads transactions, accounts, customers, branches, risk flags and the calendar from the CSVs and stores them as QVDs without cleaning. Nothing is filtered or fixed here.
+
+Script 2: cleaning
+
+It has five tabs.
+
+Tab 1, Settings. Thresholds in one place: vHighValue (50,000), vExtremeValue (200,000), vExtremeNegBalance (−100,000), and the age limits. Change a number here and every flag follows.
+
+Tab 2, Clean_Dimensions (accounts, customers, branches, calendar).
+
+Accounts: the Accounts_Std load fixes types: dates are parsed, and ₹ and commas are removed from credit_limit and current_balance before they become numbers. A second load, Clean_Accounts, reads from it with Resident and adds flags: missing balance, extreme negative balance, dormant, and overdrawn_exposure = the overdrawn amount, 0 if the balance is positive. The temporary table is then dropped.
+Customers: ages outside 18–100 become blank and are flagged. Email and phone are not loaded.
+Branches and calendar: blank regions become UNKNOWN and dates are parsed.
+
+Tab 3, Clean_Transactions.
+
+Two lookup tables (Map_AccStatus, Map_AccCloseDate) hold each account’s status and close date.
+TXN_Std standardises the data: it handles the two date formats, strips ₹ and commas, fills blank ids with UNKNOWN, and records the original row number with RecNo().
+TXN_Sorted sorts by transaction_id and then by row number. Then If(transaction_id = Peek('transaction_id'), 'Duplicate', 'First') compares each row with the one above it. The first row of each ID is “First” and every later row is “Duplicate”. This is how your 10,200 rows become 10,000.
+Clean_Transactions keeps only the “First” rows and adds the signed amount (Debit negative, Credit positive), the data-quality flags, and the risk flags: high value, extreme value, extreme negative balance, activity after the close date, and activity on a dormant account.
+Audit_Duplicate_Transactions keeps the “Duplicate” rows, so nothing disappears silently.
+
+Tab 4, Clean_RiskFlags. The same pattern. Standardise, sort so the latest copy of each risk_flag_id comes first, keep that one, and send the rest to an audit table. It adds is_high_severity, flag_orphan_risk (the transaction doesn’t exist) and flag_risk_before_txn.
+
+Tab 5, Save_Clean_Data. STORE writes every clean and audit table to a QVD, then DROP clears them from memory.
+
+Script 3: the model
+
+It reads only the clean QVDs and builds a star schema.
+
+Dimensions: DimDate, DimCustomer, DimAccount and DimBranch. Many fields are renamed (for example branch_id in accounts becomes account_branch_id), so Qlik doesn’t link tables by accident. This is also why transaction_id counts exactly 10,000: it exists in only one table.
+Account rule: if a close date exists, the status becomes Closed and account_is_active becomes N, otherwise Y.
+FactTransactions is built in a few steps:
+Load the clean transactions and risk flags into two temporary tables.
+A Mapping LOAD counts the non-orphan flags per transaction (Map_RiskCount) and the High-severity ones (Map_HighSevCount).
+ApplyMap then looks up each transaction in those maps, with 0 if it isn’t found, which gives is_risk_flagged, is_high_risk_txn and is_fraud_suspected (a High flag and at least 2 flags in total, set by vMultiRisk).
+The temporary tables are dropped.
+FactRiskFlags holds one row per flag, so tooltips can explain why something was flagged. QUALIFY transaction_id renames the field, and the hidden %txn_key links it to the transactions. Without this, you would get the 17.36K count problem from earlier.
+Audit and Reconciliation: the duplicate tables are loaded, and a Reconciliation table proves that raw rows − clean rows − duplicates = 0 for transactions and risk flags.
+Why each technique is used
+Technique	Why
+Resident	Re-reads a table that is already in memory, so the next step can build on it
+Peek()	Looks at the previous row, which is how duplicates are detected
+Mapping LOAD / ApplyMap	A fast lookup, instead of a join that could multiply rows
+QUALIFY / %key	Prevents false links between tables
+STORE to QVD	Passes cleaned data from one script to the next
+Two things to know
+Dormant flag: flag_dormant_account_activity uses the account’s status today, so it also counts transactions made before the account went dormant.
+Duplicate rule: transactions keep the first copy of a duplicate, while risk flags keep the latest, as the brief says. Your 200 duplicate transactions all differ in content, so which copy you keep affects the totals.
+
+If you’d like, I can go deeper on any one tab, or annotate your newest version line by line if you paste it.
+
+explain step by step what each line does
+
+Here is Script 3 line by line, using the saved copy with line numbers. I’ve grouped lines that do one job together. Your newest FactTransactions block has a few extra lines, and I explain those at the end of that part. Say “script 2” or “script 1” next and I’ll do the same for those.
+
+Settings tab (lines 1–7)
+Line	Code	What it does
+1	///$tab Settings	The ///$tab comment makes a new script tab named Settings.
+2	SET ThousandSep=',';	Sets the thousands separator for number display.
+3	SET DecimalSep='.';	Sets the decimal point.
+5	SET vPath = 'lib://DataFiles/';	Stores the folder path in a variable. Later lines write $(vPath) and Qlik pastes the text in, so you change the path only here. SET stores text without evaluating it.
+7	SET vMultiRisk = 2;	The number of flags that makes a transaction “multi-risk”. Used later in is_fraud_suspected.
+DimDate (lines 23–24)
+Line	What it does
+23 DimDate:	A label that names the table.
+24 LOAD * FROM [...Clean_Calendar.qvd] (qvd);	Loads every field from the calendar QVD. * means all fields and (qvd) is the file type. The transaction_date field in it links to the same-named field in the transactions, which is how dates connect.
+DimCustomer (lines 28–46)
+Line	What it does
+29–31	LOAD customer_id, customer_name, loads these fields as they are.
+32 segment as customer_segment	as renames the field, so the name says which table it came from.
+33–39	Loads the rest, renaming age, city, state, join_date and is_active with a customer_ prefix. This stops them clashing with similar fields elsewhere.
+40	FROM [...Clean_Customers.qvd] (qvd); is the source file.
+43–46	CONCATENATE (DimCustomer) LOAD 'UNKNOWN' as customer_id, ... AutoGenerate 1; appends one extra row, so transactions with no customer have something to match. AutoGenerate 1 creates a single row with no source file. This is the row that made your count 2,001.
+DimAccount (lines 49–78)
+Line	What it does
+51–52 (comments)	State the rule: a close date means Closed and not active.
+55 account_id	The key that links to the transactions.
+56 customer_id as account_customer_id	Renamed so accounts don’t link directly to customers. That would create a loop in the model.
+57 branch_id as account_branch_id	Same idea for branches.
+58–60	Loads account_type and the renamed open and close dates.
+61	If(Len(Trim(close_date)) > 0, 'Closed', status) as account_status. Trim removes spaces, and Len gives the length. If the length is above 0, a close date exists, so the status is Closed. Otherwise the original status is kept.
+62–66	Loads KYC status, risk segment, credit limit, balance and overdrawn_exposure.
+67	If(Len(Trim(close_date)) > 0, 'N', 'Y') as account_is_active. Closed gives N and everything else Y.
+68–72	The data-quality flags are renamed with an acc_ prefix. The transactions have fields with the same names, and shared names would link the tables wrongly.
+73	The source QVD.
+75–78	Adds the UNKNOWN account row, like the customer one.
+DimBranch (lines 82–98)
+
+This does the same as the others. Lines 84–92 load the fields and rename city, state and open_date to branch_city, branch_state and branch_open_date, and dq_missing_region to br_dq_missing_region. Line 93 is the source, and lines 95–98 add the UNKNOWN branch row.
+
+FactTransactions (lines 103–140)
+Line	What it does
+103–104	Tmp_Txn: loads all clean transactions into a temporary table.
+106–107	Tmp_Risk: loads all clean risk flags into a second temporary table.
+110 Map_RiskCount:	Names a mapping table.
+111 Mapping LOAD transaction_id, Count(risk_flag_id)	A mapping load has exactly two columns, a key and a value. Here: transaction and its number of flags.
+112 Resident Tmp_Risk	Reads from the table already in memory.
+113 Where flag_orphan_risk = 0	Skips flags whose transaction doesn’t exist.
+114 Group By transaction_id;	Because of the Count, one row is produced per transaction.
+117–121 Map_HighSevCount	The same, but Sum(is_high_severity) counts the High flags.
+124 FactTransactions:	Names the main table.
+126 *	Brings in every column from Tmp_Txn.
+127 transaction_id as %txn_key	A copy of the id under a hidden-style name. Fields starting with % are keys that Qlik Sense normally hides from the field list.
+128 ApplyMap('Map_RiskCount', transaction_id, 0) as risk_flag_count	Looks up this transaction in the map. If it isn’t found, the third argument, 0, is used.
+129	Same for the High-severity count.
+132	If(... > 0, 1, 0) as is_risk_flagged. 1 if it has any flag.
+134	is_high_risk_txn. 1 if it has at least one High flag.
+136–137	is_fraud_suspected. 1 only if the transaction has a High flag and (and) at least $(vMultiRisk) flags. Qlik replaces $(vMultiRisk) with 2 before the line runs.
+138 Resident Tmp_Txn;	The source of all of the above.
+140 DROP TABLES Tmp_Txn, Tmp_Risk;	Removes the temporary tables. If they stayed, both would link through transaction_id and inflate your counts.
+
+Extra lines in your newest version:
+
+account_id as %account_key, customer_id as %customer_key and branch_id as %branch_key do the same job as %txn_key. They are hidden links to the dimension tables.
+The long nested If ... as risk_status checks from the strictest group down. It gives ‘Fraud-suspected’ if there’s a High flag and at least 2 flags, otherwise ‘High-risk’ if there’s a High flag, otherwise ‘Flagged (Low/Medium)’ if there’s any flag, and otherwise ‘Clean’. Order matters: the first condition that is true wins.
+FactRiskFlags (lines 147–155)
+Line	What it does
+147 QUALIFY transaction_id;	From now on, this field gets the table name added, so it becomes FactRiskFlags.transaction_id and doesn’t link to the transactions.
+149 FactRiskFlags:	Names the table.
+151 *	Loads all columns.
+152 transaction_id as %txn_key	The hidden link to FactTransactions. This is the only connection between the two.
+153	Source file.
+155 UNQUALIFY *;	Turns the renaming off for everything after.
+Audit and reconciliation (lines 160–192)
+Lines	What they do
+160–164	Load the two duplicate-removal audit tables so duplicates stay visible in the app.
+169–174	LET vRawTxn = QvdNoOfRecords(...). LET evaluates immediately, unlike SET. QvdNoOfRecords reads the number of rows from the QVD without loading it. Six variables hold raw, clean and duplicate counts for transactions and risk flags.
+176–183	A one-row table Reconciliation: the dataset name in quotes, then $(vRawTxn) and the others as numbers, and the last column subtracts clean and duplicates from raw.
+185–192	CONCATENATE (Reconciliation) adds a second row for risk flags. A difference of 0 on both rows is your proof that nothing went missing.
