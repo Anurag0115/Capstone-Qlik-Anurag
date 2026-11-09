@@ -1,0 +1,366 @@
+///$tab Settings
+SET ThousandSep=',';
+SET DecimalSep='.';
+
+SET vPath = 'lib://DataFiles/';
+
+// Thresholds - change the numbers here
+SET vHighValue         = 50000;     // amount >= this = High Value
+SET vExtremeValue      = 200000;    // amount >= this = Extreme Value
+SET vExtremeNegBalance = -100000;   // balance below this = Extreme Negative
+SET vMinAge            = 18;
+SET vMaxAge            = 100;
+
+// ---------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------
+// TEXT: blank, NA, N/A, NULL, NAN or UNKNOWN -> 'Unknown' (otherwise the trimmed value)
+SET vTxt    = If(Len(Trim($1))=0 or Match(Upper(Trim($1)),'NA','N/A','NULL','NAN','UNKNOWN')>0, 'Unknown', Trim($1));
+// Currency: same as above, and XXX is also 'Unknown'
+SET vTxtCur = If(Len(Trim($1))=0 or Match(Upper(Trim($1)),'NA','N/A','NULL','NAN','UNKNOWN','XXX')>0, 'Unknown', Trim($1));
+// 1 if the value is blank, NA, N/A, NULL, NAN or UNKNOWN (used for the missing-value flags)
+SET vIsBad  = (Len(Trim($1))=0 or Match(Upper(Trim($1)),'NA','N/A','NULL','NAN','UNKNOWN')>0);
+
+// NUMBERS: remove the rupee symbol, commas and spaces. Not a proper number -> 0
+SET vNum    = Alt(Num#(PurgeChar(Text($1),'₹, '),'#.##','.',','), 0);
+// Same, but NULL stays NULL (only used to detect missing values for the flags)
+SET vNumRaw = Num#(PurgeChar(Text($1),'₹, '),'#.##','.',',');
+
+// DATE for the branches file: M/D/YYYY (e.g. 6/11/2020), also accepts YYYY-MM-DD and a time part.
+// Output format: DD/MM/YYYY (same as the other date fields)
+SET vDateMDY = Date(Alt(Date#(SubField(Trim(Text($1)),' ',1),'M/D/YYYY'),
+                        Date#(Left(Trim(Text($1)),10),'YYYY-MM-DD'),
+                        If(IsNum($1),Floor($1))),'DD/MM/YYYY');
+
+// TIMESTAMP for risk_flags: M/D/YYYY h:mm:ss AM/PM (e.g. 3/21/2025 7:58:30 PM)
+// Output format: DD/MM/YYYY hh:mm:ss. A blank value stays blank.
+SET vTs = Timestamp(Alt(
+              Timestamp#(Trim(Text($1)),'M/D/YYYY h:mm:ss TT'),
+              Timestamp#(Trim(Text($1)),'M/D/YYYY h:mm TT'),
+              Timestamp#(Trim(Text($1)),'YYYY-MM-DD hh:mm:ss'),
+              Timestamp#(Trim(Text($1)),'YYYY-MM-DD hh:mm')),
+          'DD/MM/YYYY hh:mm:ss');
+
+
+///$tab Clean_Dimensions
+// =====================================================================
+// PHASE 2 - DATA CLEANING (part A: accounts, customers, branches, calendar)
+// - Dates are output as DD/MM/YYYY
+// - Text: blank / NA / N/A / NULL -> 'Unknown'
+// - Numbers: blank / NA / not a number -> 0
+// - Rows are never added or removed here
+// - Flags: 1 = problem, 0 = ok
+// =====================================================================
+
+// ------------------------- ACCOUNTS ----------------------------------
+Accounts_Std:
+LOAD
+    $(vTxt(account_id))                                    as account_id,
+    $(vTxt(customer_id))                                   as customer_id,
+    $(vTxt(branch_id))                                     as branch_id,
+    $(vTxt(account_type))                                  as account_type,
+    Date(Date#(Left(Text(open_date),10),'YYYY-MM-DD'),'DD/MM/YYYY')   as open_date,
+    Date(Date#(Left(Text(close_date),10),'YYYY-MM-DD'),'DD/MM/YYYY')  as close_date,
+    $(vTxt(status))                                        as status,
+    $(vTxt(kyc_status))                                    as kyc_status,
+    $(vTxt(risk_segment))                                  as risk_segment,
+    $(vNum(credit_limit))                                  as credit_limit,
+    Round($(vNum(current_balance)),0.01)                   as current_balance,
+    $(vTxt(is_active))                                     as is_active,
+    If($(vIsBad(customer_id)),1,0)                         as dq_missing_customer,
+    If($(vIsBad(branch_id)),1,0)                           as dq_missing_branch,
+    // 1 = the balance in the file was blank / NA / not a number (it is shown as 0)
+    If(IsNum($(vNumRaw(current_balance))),0,1)             as dq_missing_balance
+FROM [$(vPath)Raw_accounts.qvd] (qvd);
+
+Clean_Accounts:
+LOAD
+    *,
+    If(current_balance < $(vExtremeNegBalance),1,0)        as flag_extreme_negative_balance,
+    If(status='Dormant',1,0)                               as flag_dormant_account,
+    // Exposure = how much the account is overdrawn
+    If(current_balance < 0, Fabs(current_balance), 0)      as overdrawn_exposure
+Resident Accounts_Std;
+
+DROP TABLE Accounts_Std;
+
+
+// ------------------------- CUSTOMERS ---------------------------------
+// email and phone are not loaded on purpose (personal data, not needed)
+// Age: not a number -> 0. Age outside the allowed range -> 0 and flag_age_invalid = 1.
+Clean_Customers:
+LOAD
+    customer_id,
+    customer_name,
+    segment,
+    gender,
+    If(age_num>=$(vMinAge) and age_num<=$(vMaxAge), age_num, 0)   as age,
+    city,
+    state,
+    join_date,
+    is_active,
+    If(age_num<$(vMinAge) or age_num>$(vMaxAge),1,0)              as flag_age_invalid;
+LOAD
+    $(vTxt(customer_id))                                   as customer_id,
+    $(vTxt(customer_name))                                 as customer_name,
+    $(vTxt(segment))                                       as segment,
+    $(vTxt(gender))                                        as gender,
+    $(vNum(age))                                           as age_num,
+    $(vTxt(city))                                          as city,
+    $(vTxt(state))                                         as state,
+    Date(Date#(Left(Text(join_date),10),'YYYY-MM-DD'),'DD/MM/YYYY')   as join_date,
+    $(vTxt(is_active))                                     as is_active
+FROM [$(vPath)Raw_customers.qvd] (qvd);
+
+
+// ------------------------- BRANCHES ----------------------------------
+// open_date in the branches file is M/D/YYYY (e.g. 6/11/2020)
+Clean_Branches:
+LOAD
+    $(vTxt(branch_id))                                     as branch_id,
+    $(vTxt(branch_name))                                   as branch_name,
+    $(vTxt(city))                                          as city,
+    $(vTxt(state))                                         as state,
+    $(vTxt(region))                                        as region,
+    $(vTxt(branch_type))                                   as branch_type,
+    $(vTxt(manager_id))                                    as manager_id,
+    $(vDateMDY(open_date))                                 as open_date,
+    If($(vIsBad(region)),1,0)                              as dq_missing_region
+FROM [$(vPath)Raw_branches.qvd] (qvd);
+
+
+// ------------------------- CALENDAR ----------------------------------
+// Generated table, loaded as it is (only the date format is set)
+Clean_Calendar:
+LOAD
+    Date(Date#(Left(Text(date),10),'YYYY-MM-DD'),'DD/MM/YYYY')        as transaction_date,
+    date_key,
+    year,
+    month,
+    month_name,
+    week_of_year,
+    day_name,
+    is_weekend
+FROM [$(vPath)Raw_calendar.qvd] (qvd);
+
+
+///$tab Clean_Transactions
+// =====================================================================
+// PHASE 2 - DATA CLEANING (part B: transactions)
+// Duplicates: the FIRST ROW IN THE FILE is kept for each transaction_id.
+// Text: blank / NA / N/A / NULL -> 'Unknown' (currency: XXX also 'Unknown')
+// Numbers (amount, signed amount, balance): not a number -> 0
+// =====================================================================
+
+// Lookups from the clean accounts (used for the flags)
+Map_AccStatus:
+Mapping LOAD account_id, status Resident Clean_Accounts;
+
+Map_AccCloseDate:
+Mapping LOAD account_id, close_date Resident Clean_Accounts;
+
+
+// Step 1: standardise dates, amounts and ids
+TXN_Std:
+LOAD
+    transaction_id,
+
+    // Timestamp -> date only (DD/MM/YYYY). Two input formats exist: 2025-06-05 ... and 05/06/2025 ...
+    Date(If(Index(Text(transaction_ts),'/')>0,
+            Date#(Left(Text(transaction_ts),10),'DD/MM/YYYY'),
+            Date#(Left(Text(transaction_ts),10),'YYYY-MM-DD')),'DD/MM/YYYY') as transaction_date,
+
+    Date(If(Index(Text(created_ts),'/')>0,
+            Date#(Left(Text(created_ts),10),'DD/MM/YYYY'),
+            Date#(Left(Text(created_ts),10),'YYYY-MM-DD')),'DD/MM/YYYY')     as txn_created_date,
+
+    $(vTxt(account_id))                                    as account_id,
+    $(vTxt(customer_id))                                   as customer_id,
+    $(vTxt(branch_id))                                     as branch_id,
+    $(vTxt(txn_type))                                      as txn_type,
+    $(vTxt(channel))                                       as channel,
+    $(vTxtCur(currency))                                   as currency,
+    $(vNumRaw(amount))                                     as amount_num,
+    $(vNumRaw(signed_amount))                              as signed_num,
+    Round($(vNumRaw(balance_after_txn)),0.01)              as balance_raw,
+    $(vTxt(merchant_category))                             as merchant_category,
+    $(vTxt(counterparty_type))                             as counterparty_type,
+    $(vTxt(counterparty_id))                               as counterparty_id,
+    $(vTxt(reference_note))                                as reference_note,
+
+    // Lineage: row number in the raw file (1 = first row)
+    source_file                                            as txn_source_file,
+    RecNo()                                                as txn_source_row,
+
+    // Missing value flags (worked out from the raw values, before anything is replaced)
+    If($(vIsBad(account_id)),1,0)                          as dq_missing_account,
+    If($(vIsBad(customer_id)),1,0)                         as dq_missing_customer,
+    If($(vIsBad(branch_id)),1,0)                           as dq_missing_branch,
+    If(IsNum($(vNumRaw(amount))) or IsNum($(vNumRaw(signed_amount))),0,1) as dq_missing_amount,
+    If(IsNum($(vNumRaw(balance_after_txn))),0,1)           as dq_missing_balance
+FROM [$(vPath)Raw_transactions.qvd] (qvd);
+
+
+// Step 2: sort by transaction_id and then by the row number in the file.
+// The first row of each transaction_id (the one that appears first in the file)
+// is marked 'First'. Any later row with the same id is marked 'Duplicate'.
+TXN_Sorted:
+LOAD
+    *,
+    // If amount is missing, use the signed amount; if both are missing, 0
+    Alt(Fabs(amount_num), Fabs(signed_num), 0)             as amount,
+    // Balance not a number -> 0
+    Alt(balance_raw, 0)                                    as balance_after_txn,
+    If(transaction_id = Peek('transaction_id'), 'Duplicate', 'First') as dup_status
+Resident TXN_Std
+Order By transaction_id, txn_source_row;
+
+DROP TABLE TXN_Std;
+
+
+// Step 3: keep only the FIRST row and add the flags
+Clean_Transactions:
+LOAD
+    transaction_id,
+    transaction_date,
+    txn_created_date,
+    account_id,
+    customer_id,
+    branch_id,
+    txn_type,
+    channel,
+    currency,
+    merchant_category,
+    counterparty_type,
+    counterparty_id,
+    reference_note,
+    amount,                                                // always positive
+    If(txn_type='Debit', -amount, amount)                  as signed_amount,   // Debit = -, Credit = +
+    balance_after_txn,
+
+    // ---- Data quality flags ----
+    dq_missing_account,
+    dq_missing_customer,
+    dq_missing_branch,
+    If(IsNull(transaction_date),1,0)                       as dq_missing_date,
+    dq_missing_amount,
+    dq_missing_balance,
+    // Debit with a positive sign, or Credit with a negative sign
+    If((txn_type='Debit' and signed_num>0) or (txn_type='Credit' and signed_num<0),1,0) as dq_sign_mismatch,
+
+    // ---- Risk flags ----
+    If(amount >= $(vHighValue),1,0)                        as flag_high_value,
+    If(amount >= $(vExtremeValue),1,0)                     as flag_extreme_value,
+    If(balance_after_txn < $(vExtremeNegBalance),1,0)      as flag_extreme_negative_balance,
+    // Transaction after the account close date
+    If(transaction_date > ApplyMap('Map_AccCloseDate', account_id, Null()),1,0) as flag_closed_account_activity,
+    // Transaction on a dormant account
+    If(ApplyMap('Map_AccStatus', account_id, 'Unknown')='Dormant',1,0)          as flag_dormant_account_activity,
+
+    // ---- Lineage ----
+    txn_source_file,
+    txn_source_row
+Resident TXN_Sorted
+Where dup_status = 'First';
+
+
+// Audit table: the duplicates we removed (kept for audit, not hidden)
+Audit_Duplicate_Transactions:
+LOAD
+    transaction_id                                         as removed_transaction_id,
+    txn_created_date                                       as removed_created_date,
+    amount                                                 as removed_amount,
+    txn_source_row                                         as removed_source_row,
+    'Duplicate - first row in file was kept'               as txn_removal_reason
+Resident TXN_Sorted
+Where dup_status = 'Duplicate';
+
+DROP TABLE TXN_Sorted;
+
+
+///$tab Clean_RiskFlags
+// =====================================================================
+// PHASE 2 - DATA CLEANING (part C: risk flags)
+// Clean_RiskFlags has ONLY the columns of the risk flags file:
+//   risk_flag_id, transaction_id, account_id, customer_id, risk_ts,
+//   risk_code, risk_severity, risk_reason, model_score, created_ts
+// risk_ts and created_ts: source M/D/YYYY h:mm:ss AM/PM -> DD/MM/YYYY hh:mm:ss
+//   (a blank timestamp stays blank)
+// Text: blank / NA / N/A / NULL -> 'Unknown'.  model_score: not a number -> 0.
+// Rule: keep the LATEST copy of each risk_flag_id (by created_ts).
+// =====================================================================
+
+// Step 1: standardise (risk_source_row is a helper, not kept in the final table)
+Risk_Std:
+LOAD
+    risk_flag_id,
+    $(vTxt(transaction_id))                                as transaction_id,
+    $(vTxt(account_id))                                    as account_id,
+    $(vTxt(customer_id))                                   as customer_id,
+    $(vTs(risk_ts))                                        as risk_ts,
+    $(vTxt(risk_code))                                     as risk_code,
+    $(vTxt(risk_severity))                                 as risk_severity,
+    $(vTxt(risk_reason))                                   as risk_reason,
+    $(vNum(model_score))                                   as model_score,
+    $(vTs(created_ts))                                     as created_ts,
+    RecNo()                                                as risk_source_row
+FROM [$(vPath)Raw_risk_flags.qvd] (qvd);
+
+
+// Step 2: sort so the LATEST copy of each risk_flag_id comes first.
+Risk_Sorted:
+LOAD
+    *,
+    If(risk_flag_id = Peek('risk_flag_id'), 'Duplicate', 'First') as dup_status
+Resident Risk_Std
+Order By risk_flag_id, created_ts desc, risk_source_row desc;
+
+DROP TABLE Risk_Std;
+
+
+// Step 3: keep one copy - only the columns of the file
+Clean_RiskFlags:
+LOAD
+    risk_flag_id,
+    transaction_id,
+    account_id,
+    customer_id,
+    risk_ts,
+    risk_code,
+    risk_severity,
+    risk_reason,
+    model_score,
+    created_ts
+Resident Risk_Sorted
+Where dup_status = 'First';
+
+
+// Audit table: duplicate risk flags removed
+Audit_Duplicate_RiskFlags:
+LOAD
+    risk_flag_id                                           as removed_risk_flag_id,
+    created_ts                                             as removed_created_ts,
+    'Duplicate - latest copy was kept'                     as risk_removal_reason
+Resident Risk_Sorted
+Where dup_status = 'Duplicate';
+
+DROP TABLE Risk_Sorted;
+
+
+///$tab Save_Clean_Data
+// =====================================================================
+// Save all clean tables as QVD so Script 3 can use them
+// =====================================================================
+
+STORE Clean_Accounts               INTO [$(vPath)Clean_Accounts.qvd]               (qvd);
+STORE Clean_Customers              INTO [$(vPath)Clean_Customers.qvd]              (qvd);
+STORE Clean_Branches               INTO [$(vPath)Clean_Branches.qvd]               (qvd);
+STORE Clean_Calendar               INTO [$(vPath)Clean_Calendar.qvd]               (qvd);
+STORE Clean_Transactions           INTO [$(vPath)Clean_Transactions.qvd]           (qvd);
+STORE Clean_RiskFlags              INTO [$(vPath)Clean_RiskFlags.qvd]              (qvd);
+STORE Audit_Duplicate_Transactions INTO [$(vPath)Audit_Duplicate_Transactions.qvd] (qvd);
+STORE Audit_Duplicate_RiskFlags    INTO [$(vPath)Audit_Duplicate_RiskFlags.qvd]    (qvd);
+
+DROP TABLES Clean_Accounts, Clean_Customers, Clean_Branches, Clean_Calendar,
+            Clean_Transactions, Clean_RiskFlags,
+            Audit_Duplicate_Transactions, Audit_Duplicate_RiskFlags;

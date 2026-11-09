@@ -1,0 +1,47 @@
+///$tab Settings
+SET ThousandSep=',';
+SET DecimalSep='.';
+
+SET vPath = 'lib://DataFiles/';     // folder with the CSV files (QVDs are saved here too)
+
+
+///$tab Raw_Data
+// =====================================================================
+// PHASE 1 - RAW DATA
+// Load the files exactly as they are. No cleaning, no filtering.
+// The original CSV files are only read, never changed.
+// =====================================================================
+
+Raw_transactions:
+LOAD * FROM [$(vPath)transactions.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_transactions INTO [$(vPath)Raw_transactions.qvd] (qvd);
+
+Raw_accounts:
+LOAD * FROM [$(vPath)accounts.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_accounts INTO [$(vPath)Raw_accounts.qvd] (qvd);
+
+Raw_customers:
+LOAD * FROM [$(vPath)customers.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_customers INTO [$(vPath)Raw_customers.qvd] (qvd);
+
+Raw_branches:
+LOAD * FROM [$(vPath)branches.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_branches INTO [$(vPath)Raw_branches.qvd] (qvd);
+
+Raw_risk_flags:
+LOAD * FROM [$(vPath)risk_flags.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_risk_flags INTO [$(vPath)Raw_risk_flags.qvd] (qvd);
+
+Raw_calendar:
+LOAD * FROM [$(vPath)calendar.csv]
+(txt, utf8, embedded labels, delimiter is ',', msq);
+STORE Raw_calendar INTO [$(vPath)Raw_calendar.qvd] (qvd);
+
+// Raw data is saved, free the memory
+DROP TABLES Raw_transactions, Raw_accounts, Raw_customers,
+            Raw_branches, Raw_risk_flags, Raw_calendar;

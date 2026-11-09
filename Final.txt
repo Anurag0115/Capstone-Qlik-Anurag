@@ -1,0 +1,212 @@
+///$tab Settings
+SET ThousandSep=',';
+SET DecimalSep='.';
+
+SET vPath = 'lib://DataFiles/';
+
+SET vMultiRisk = 2;     // 2 or more risk flags = Multi-risk
+
+
+///$tab Final_Model
+// =====================================================================
+// PHASE 3 - DATA TRANSFORMATION (FINAL DATA FOR REPORTING)
+//
+// Star schema:
+//   FactTransactions (1 row = 1 transaction)
+//   FactRiskFlags    (1 row = 1 risk flag)
+//   DimCustomer, DimAccount, DimBranch, DimDate
+//
+// NAMING: a column that exists in several tables is shown with the table name,
+// so every count comes from ONE table only:
+//   FactTransactions : Transaction_account_id, Transaction_customer_id, Transaction_branch_id
+//   DimAccount       : Account_account_id
+//   DimCustomer      : Customer_customer_id
+//   DimBranch        : Branch_branch_id
+//   FactRiskFlags    : Risk_transaction_id, Risk_account_id, Risk_customer_id
+// The tables are linked by hidden key fields that start with % (%account_key,
+// %customer_key, %branch_key, %txn_key).
+// No "Unknown" rows are added to the dimensions: row counts match the files.
+// =====================================================================
+
+
+// ------------------------- DIM DATE ----------------------------------
+DimDate:
+LOAD * FROM [$(vPath)Clean_Calendar.qvd] (qvd);
+
+
+// ------------------------- DIM CUSTOMER ------------------------------
+DimCustomer:
+LOAD
+    customer_id        as %customer_key,
+    customer_id        as Customer_customer_id,
+    customer_name,
+    segment            as customer_segment,
+    gender,
+    age                as customer_age,
+    city               as customer_city,
+    state              as customer_state,
+    join_date          as customer_join_date,
+    is_active          as customer_is_active,
+    flag_age_invalid
+FROM [$(vPath)Clean_Customers.qvd] (qvd);
+
+
+// ------------------------- DIM ACCOUNT -------------------------------
+// Rules:
+//   close_date present -> account_status = 'Closed'
+//   is_account_active:  Dormant or Closed -> 'N',  Active -> 'Y',  anything else -> 'Unknown'
+DimAccount:
+LOAD
+    *,
+    If(WildMatch(account_status,'Dormant','Closed')>0, 'N',
+       If(Upper(account_status)='ACTIVE', 'Y', 'Unknown'))   as is_account_active;
+LOAD
+    account_id         as %account_key,
+    account_id         as Account_account_id,
+    customer_id        as account_customer_id,
+    branch_id          as account_branch_id,
+    account_type,
+    open_date          as account_open_date,
+    close_date         as account_close_date,
+    If(Len(Trim(close_date)) > 0, 'Closed', status)   as account_status,
+    kyc_status,
+    risk_segment       as account_risk_segment,
+    credit_limit,
+    current_balance,
+    overdrawn_exposure,
+    dq_missing_customer           as acc_dq_missing_customer,
+    dq_missing_branch             as acc_dq_missing_branch,
+    dq_missing_balance            as acc_dq_missing_balance,
+    flag_extreme_negative_balance as acc_flag_extreme_negative_balance,
+    flag_dormant_account          as acc_flag_dormant_account
+FROM [$(vPath)Clean_Accounts.qvd] (qvd);
+
+
+// ------------------------- DIM BRANCH --------------------------------
+DimBranch:
+LOAD
+    branch_id          as %branch_key,
+    branch_id          as Branch_branch_id,
+    branch_name,
+    city               as branch_city,
+    state              as branch_state,
+    region,
+    branch_type,
+    manager_id,
+    open_date          as branch_open_date,
+    dq_missing_region  as br_dq_missing_region
+FROM [$(vPath)Clean_Branches.qvd] (qvd);
+
+
+// ------------------------- FACT TRANSACTIONS -------------------------
+// Load clean transactions and risk flags into temporary tables
+Tmp_Txn:
+LOAD * FROM [$(vPath)Clean_Transactions.qvd] (qvd);
+
+Tmp_Risk:
+LOAD * FROM [$(vPath)Clean_RiskFlags.qvd] (qvd);
+
+// Which transaction_ids exist (used to ignore orphan risk flags)
+Map_TxnExists:
+Mapping LOAD transaction_id, 1
+Resident Tmp_Txn;
+
+// Count the (non-orphan) risk flags per transaction
+Map_RiskCount:
+Mapping LOAD transaction_id, Count(risk_flag_id)
+Resident Tmp_Risk
+Where ApplyMap('Map_TxnExists', transaction_id, 0) = 1
+Group By transaction_id;
+
+// Count the High-severity flags per transaction
+Map_HighSevCount:
+Mapping LOAD transaction_id, Sum(If(risk_severity='High',1,0))
+Resident Tmp_Risk
+Where ApplyMap('Map_TxnExists', transaction_id, 0) = 1
+Group By transaction_id;
+
+// If a transaction has no risk flags, ApplyMap gives 0
+FactTransactions:
+LOAD
+    *,
+    // hidden link keys
+    transaction_id                                         as %txn_key,
+    account_id                                             as %account_key,
+    customer_id                                            as %customer_key,
+    branch_id                                              as %branch_key,
+
+    ApplyMap('Map_RiskCount', transaction_id, 0)           as risk_flag_count,
+    ApplyMap('Map_HighSevCount', transaction_id, 0)        as high_severity_flag_count,
+
+    // Risk-flagged vs clean
+    If(ApplyMap('Map_RiskCount', transaction_id, 0) > 0, 1, 0)           as is_risk_flagged,
+    // High-risk = has at least one High-severity flag
+    If(ApplyMap('Map_HighSevCount', transaction_id, 0) > 0, 1, 0)        as is_high_risk_txn,
+    // Fraud-suspected = High-severity flag AND 2 or more flags in total
+    If(ApplyMap('Map_HighSevCount', transaction_id, 0) > 0
+       and ApplyMap('Map_RiskCount', transaction_id, 0) >= $(vMultiRisk), 1, 0) as is_fraud_suspected
+Resident Tmp_Txn;
+
+DROP TABLES Tmp_Txn, Tmp_Risk;
+
+// Show the ids with the table name (the hidden % keys do the linking)
+RENAME FIELD account_id  TO Transaction_account_id;
+RENAME FIELD customer_id TO Transaction_customer_id;
+RENAME FIELD branch_id   TO Transaction_branch_id;
+
+
+// ------------------------- FACT RISK FLAGS ---------------------------
+// One row per risk flag, with exactly the columns of the risk flags file.
+// The ids carry the table name so they do not link to other tables;
+// the risk flags link to the transactions through %txn_key.
+FactRiskFlags:
+LOAD
+    risk_flag_id,
+    transaction_id     as Risk_transaction_id,
+    transaction_id     as %txn_key,
+    account_id         as Risk_account_id,
+    customer_id        as Risk_customer_id,
+    risk_ts,
+    risk_code,
+    risk_severity,
+    risk_reason,
+    model_score,
+    created_ts
+FROM [$(vPath)Clean_RiskFlags.qvd] (qvd);
+
+
+// ------------------------- AUDIT TABLES ------------------------------
+// Duplicates that were removed - shown in the app, not hidden
+Audit_Duplicate_Transactions:
+LOAD * FROM [$(vPath)Audit_Duplicate_Transactions.qvd] (qvd);
+
+Audit_Duplicate_RiskFlags:
+LOAD * FROM [$(vPath)Audit_Duplicate_RiskFlags.qvd] (qvd);
+
+
+// ------------------------- RECONCILIATION ----------------------------
+// Raw rows must equal Clean rows + Duplicates removed (difference = 0)
+LET vRawTxn    = QvdNoOfRecords('$(vPath)Raw_transactions.qvd');
+LET vCleanTxn  = QvdNoOfRecords('$(vPath)Clean_Transactions.qvd');
+LET vDupTxn    = QvdNoOfRecords('$(vPath)Audit_Duplicate_Transactions.qvd');
+LET vRawRisk   = QvdNoOfRecords('$(vPath)Raw_risk_flags.qvd');
+LET vCleanRisk = QvdNoOfRecords('$(vPath)Clean_RiskFlags.qvd');
+LET vDupRisk   = QvdNoOfRecords('$(vPath)Audit_Duplicate_RiskFlags.qvd');
+
+Reconciliation:
+LOAD
+    'Transactions'                                         as dataset,
+    $(vRawTxn)                                             as raw_rows,
+    $(vCleanTxn)                                           as clean_rows,
+    $(vDupTxn)                                             as duplicates_removed,
+    $(vRawTxn) - $(vCleanTxn) - $(vDupTxn)                 as difference
+AutoGenerate 1;
+
+CONCATENATE (Reconciliation)
+LOAD
+    'Risk Flags'                                           as dataset,
+    $(vRawRisk)                                            as raw_rows,
+    $(vCleanRisk)                                          as clean_rows,
+    $(vDupRisk)                                            as duplicates_removed,
+    $(vRawRisk) - $(vCleanRisk) - $(vDupRisk)              as difference
+AutoGenerate 1;
